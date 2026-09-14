@@ -65,7 +65,7 @@ In both instances of the distinct double charges:
 -  `ch_7f0a3c` and `ch_7f0a41` from the payment provider resolved successfully. 
 - `r1` and `r2`  independently created payment records and updated order, `status='paid'`.
 
-To clarify these assumption and trace the actual execution path within `r1` and `r2` lifecycle, one piece of evidence is crucial, the application log at the http layer. This log contains a detailed p, sufficient to draw a timeline. 
+To clarify these assumption and trace the actual execution path within `r1` and `r2` lifecycle, one piece of evidence is crucial, the application log at the http layer. This log contains a detailed request logs, sufficient to draw a timeline. 
 
 **Request Logs**
 ```
