@@ -1,8 +1,8 @@
 ---
 title: The Order That Got Charged Twice - A Race Condition Post-Mortem
 published: "false"
-tags:
-concepts: "[race-condition, check-then-act, optimistic-concurrency, atomic-updates, prisma, postgresql-isolation]"
+tags: backend, postgresql, systemdesign, node.js
+concepts: "[race-condition, check-then-act, optimistic-concurrency, atomic-updates, Prisma, PostgreSQL-isolation]"
 ---
 ## The Symptom ##
 Over the past 48 hours, the support team has received 6 tickets from customers who were charged twice for a single order. Refunds have been manually issued, but engineering hasn’t identified the cause. 
@@ -12,26 +12,26 @@ Customer `cus_8841` placed order `ord_20394` for `$87.50`, four seconds apart.
 ## Begin Investigation. ##
 The first logical instinct is to query the database, our source of truth in this case. 
 
-### Database Query Result (run against `orders` and `payments` table for `ord_20394` ) ###
+### Database Query Result (run against the `orders` and `payments` tables for `ord_20394`) ###
 
 
 **orders**
 
 | id        | status | amount | customer_id | updated_at              |
 | --------- | ------ | ------ | ----------- | ----------------------- |
-| ord_20394 | paid   | 87.50  | cus_8841    | 2026-09-09 14:22:31.812 |
+| ord_20394 | paid   | 87.50 | cus_8841  | 2026-09-09 14:22:31.812 |
 
 **payments**
 
 | id         | order_id  | amount | status    | provider_charge_id | created_at              |
 | ---------- | --------- | ------ | --------- | ------------------ | ----------------------- |
-| pay_9a31f2 | ord_20394 | 87.50  | succeeded | ch_7f0a3c          | 2026-09-09 14:22:27.501 |
-| pay_9a31f9 | ord_20394 | 87.50  | succeeded | ch_7f0a41          | 2026-09-09 14:22:31.809 |
+| pay_9a31f2 | ord_20394 | 87.50 | succeeded | ch_7f0a3c  | 2026-09-09 14:22:27.501 |
+| pay_9a31f9 | ord_20394 | 87.50 | succeeded | ch_7f0a41  | 2026-09-09 14:22:31.809 |
 
 ### Facts From The Evidence. ###
-- there is indeed a single order recorded for that customer. 
-- two distinct payment records, `r1` and `r2` was recorded for the single order, four seconds apart. 
-- the payment records for both `r1` and `r2` resolved successfully. 
+- There is indeed a single order recorded for that customer. 
+- Two distinct payment records, `r1` and `r2` was recorded for the single order, four seconds apart. 
+- The payment records for both `r1` and `r2` resolved successfully. 
 
 ### Tracing the Execution Flow. ###
 To make sense of this, I went straight to the call site of the payment provider. 
@@ -57,18 +57,18 @@ async processPayment(orderId: string): Promise<PaymentResult> {
 }
 ```
 
-Tracing the path of execution from the code, the call to the payment provider for charge is guarded conditionally by a state column, `status`. In other words, an `order` must be in a `pending` state before a charge is allowed. 
+Tracing the path of execution from the code, the call to the payment provider for charge is guarded conditionally by a state column, `status`. In other words, a `order` must be in a `pending` state before a charge is allowed. 
 
 **Logical assumption based on `processPayment`**
 In both instances of the distinct double charges:
-- `r1` and `r2` passed the conditional state check, `state='pending'` then proceeded to charge. 
--  `ch_7f0a3c` and `ch_7f0a41` from the payment provider resolved successfully. 
-- `r1` and `r2`  independently created payment records and updated order, `status='paid'`.
+- `r1` and `r2` passed the conditional state check; `state='pending'` then proceeded to charge. 
+- `ch_7f0a3c` and `ch_7f0a41` from the payment provider resolved successfully. 
+- `r1` and `r2` independently created payment records and updated order `status='paid'`.
 
-To clarify these assumption and trace the actual execution path within `r1` and `r2` lifecycle, one piece of evidence is crucial, the application log at the http layer. This log contains a detailed request logs, sufficient to draw a timeline. 
+To clarify these assumptions and trace the actual execution path within the `r1` and `r2` lifecycle, one piece of evidence is crucial: the application log at the HTTP layer. This log contains detailed request logs, sufficient to draw a timeline. 
 
 **Request Logs**
-```
+```plaintext
 14:22:27.410  req_id=r1-88c2  POST /orders/ord_20394/pay
 14:22:27.418  req_id=r2-88c9  POST /orders/ord_20394/pay
 
@@ -114,26 +114,26 @@ sequenceDiagram
 ``` 
 
 **The Trace (Execution Flow)**
-- `r1` reads order, `pending`.
+- `r1` reads order `pending`.
 - `r2` reads order, `pending` (8 milliseconds later, before `r1` writes anything). 
 - `r1` and `r2` hold their in-memory copy of `status='pending'` within their independent execution contexts (each unaware of the other one). 
 - both proceed to `charge().` 
 - `r1` finishes first, marked order paid. 
-- `r2` (still mid-flight) retries its timed-out charge and resolved successfully (has no way of knowing `r1` already wrote paid). 
-- `r2` finishes, resolved successfully, marked order paid again (no-op overwrite, since nothing enforces that the row was still pending at the write time either). 
+- `r2` (still mid-flight) retries its timed-out charge and resolves successfully (has no way of knowing `r1` already wrote paid). 
+- `r2` finishes, resolved successfully, and marked the order paid again (no-op overwrite, since nothing enforces that the row was still pending at the write time either). 
 
 **The Underlying Principle**
-A plain `SELECT` (the mechanism behind `findById`) is a snapshot read. It returns the row's value at the time of read. It does not guarantee that the value will be the same by the time you come back to act on it. It also doesn't prevent other transactions from reads and writes.
+A plain `SELECT` (the mechanism behind `findById`) is a snapshot read. It returns the row's value at the time of read. It does not guarantee that the value will be the same by the time you come back to act on it. Furthermore, it also doesn't prevent other transactions from reads and writes.
 
-This is a classic case of check-then-act race condition. A bug pattern where a condition is read in one step, and acted on in a separate step. There's no promise the condition still holds by the time of the act. 
+This is a classic case of a check-then-act race condition. A bug pattern where a condition is read in one step and acted on in a separate step. There's no promise the condition still holds by the time of the act. 
 
 **The Fix.**
 There are multiple design choices to address this check-and-act problem. Two common ones are pessimistic lock and optimistic lock. I took the optimistic concurrency control via a state column approach. 
 
 **The Trade-Off.**
-- optimistic concurrency is cheap to implement,
-- no waiting or lock held during the call to `charge()`; the losing request finds out immediately (`count === 0`), fails fast and return early rather than blocking,
-- doesn't hold database connection, this matters under load and across retrying http calls. 
+- Optimistic concurrency is cheap to implement.
+- No waiting or lock held during the call to `charge()`; the losing request finds out immediately (`count === 0`), fails fast, and returns early rather than blocking.
+- Doesn't hold a database connection; this matters under load and across retrying HTTP calls. 
 
 **Implementing Fix.**
 
@@ -147,9 +147,9 @@ async claimForPayment(id: string): Promise<{ claimed: boolean }> {
 }
 ``` 
 
-`updateMany()` lets Postgres evaluate the WHERE conditions (`id=x`, `status='pending'`). This operation combines the conditional check and the update into a single atomic write. It doesn't throw on zero matches. Rather, it returns the count matching how many rows was touched/modified.
+`updateMany()` lets Postgres evaluate the WHERE conditions (`id=x` and `status='pending'`). This operation combines the conditional check and the update into a single atomic write. It doesn't throw on zero matches. Rather, it returns the count matching how many rows were touched/modified.
 
-**Applying The Fix.**
+**Applying the Fix.**
 ``` typescript
 async processPayment(orderId: string): Promise<PaymentResult> {
   const order = await this.ordersRepo.findById(orderId);
@@ -191,12 +191,12 @@ async processPayment(orderId: string): Promise<PaymentResult> {
 }
 ```
 
-After the first caller flips the state, the row no longer satisfy the condition. The second concurrent caller's `updateMany()` on the same row matches zero count. That is the stop signal that prevents charge from being called subsequently.
+After the first caller flips the state, the row no longer satisfies the condition. The second concurrent caller's `updateMany()` on the same row matches zero count. That is the stop signal that prevents the `charge` from being called subsequently.
 
-After a charge (`state='processing`') resolves to failed, it is important to rollback from processing state to pending state. Without this, a failed charge would leave the order, permanently stuck in processing and unpayable. 
+After a charge (`state='processing'`) resolves to failed, it is important to roll back from the processing state to the pending state. Without this, a failed charge would leave the order permanently stuck in processing and unpayable. 
 
 **Conclusion**
-The logs confirmed two distinct requests from the same client IP. The evidence wasn't sufficient enough to establish why two results came in concurrently from the client. Some likely possibilities:
+The logs confirmed two distinct requests from the same client IP. The evidence wasn't sufficient to establish why two results came in concurrently from the client. Some likely possibilities:
 - double-click with no submit-button disabling,
 - a client-side retry implementation,
 - a proxy-level retry, etcetera. 
